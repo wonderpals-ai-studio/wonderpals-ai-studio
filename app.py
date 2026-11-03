@@ -444,39 +444,14 @@ async def video_create(
         if proc.returncode != 0:
             raise RuntimeError("Neizdevās apvienot ainas: " + err.decode(errors="replace")[-400:])
 
-       
-music_path = Path("assets/music/background.mp3")
-final_path = work / "wonderpals_video.mp4"
-
-audio_inputs = ["-i", str(voice_path)]
-filter_complex = "[0:a]volume=1.0[aout]"
-
-if music_path.exists():
-    test_music = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(music_path),
-         "-t", "2", "-f", "null", "-"],
-        capture_output=True
-    )
-
-    if test_music.returncode == 0:
-        audio_inputs += ["-stream_loop", "-1", "-i", str(music_path)]
-        filter_complex = (
-            "[0:a]volume=1.0[voice];"
-            "[1:a]volume=0.16[music];"
-            "[voice][music]amix=inputs=2:duration=first:"
-            "dropout_transition=2[aout]"
-        )
-
-cmd = [
-    "ffmpeg", "-y", "-i", str(silent_video),
-    *audio_inputs,
-    "-filter_complex", filter_complex,
-    "-map", "0:v:0", "-map", "[aout]",
-    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-    "-shortest", "-movflags", "+faststart",
-    str(final_path)
-]
-
+        music_path = Path("assets/music/background.mp3")
+        final_path = work / "wonderpals_video.mp4"
+        if music_path.exists():
+            audio_inputs = ["-i", str(voice_path), "-stream_loop", "-1", "-i", str(music_path)]
+            filter_complex = "[0:a]volume=1.0[voice];[1:a]volume=0.16[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+            cmd = ["ffmpeg", "-y", "-i", str(silent_video), *audio_inputs, "-filter_complex", filter_complex,
+                   "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                   "-shortest", "-movflags", "+faststart", str(final_path)]
         else:
             cmd = ["ffmpeg", "-y", "-i", str(silent_video), "-i", str(voice_path), "-map", "0:v:0", "-map", "1:a:0",
                    "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(final_path)]

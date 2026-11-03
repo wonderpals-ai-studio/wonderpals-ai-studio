@@ -1,2 +1,5 @@
 fastapi
 uvicorn[standard]
+google-auth-oauthlib
+google-cloud-secret-manager
+itsdangerous

@@ -4,11 +4,13 @@ import logging
 import os
 import tempfile
 import subprocess
+import wave
+import math
 from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
@@ -345,40 +347,124 @@ class SpeechRequest(BaseModel):
     voice: str = Field(default="narrator", pattern="^(narrator|rabbit|turtle)$")
 
 
+
+
+async def make_piper_wav(text: str, voice: str, output_path: str) -> None:
+    if not PIPER_ENABLED:
+        raise RuntimeError("Piper balss ģenerēšana ir izslēgta.")
+    voice_model = PIPER_VOICES[voice]
+    process = await __import__("asyncio").create_subprocess_exec(
+        "piper", "--model", voice_model, "--output_file", output_path,
+        stdin=__import__("asyncio").subprocess.PIPE,
+        stdout=__import__("asyncio").subprocess.PIPE,
+        stderr=__import__("asyncio").subprocess.PIPE,
+    )
+    _, stderr = await process.communicate(text.encode("utf-8"))
+    if process.returncode != 0 or not Path(output_path).exists() or Path(output_path).stat().st_size < 1000:
+        raise RuntimeError(stderr.decode("utf-8", errors="replace")[-500:] or "Piper audio kļūda.")
+
 @app.post("/speech/generate")
 async def speech_generate(data: SpeechRequest):
-    """Generate speech only when the user presses the audio button."""
-    if not PIPER_ENABLED:
-        return JSONResponse({"ok": False, "error": "Piper balss ģenerēšana ir izslēgta."}, status_code=503)
-    voice_model = PIPER_VOICES[data.voice]
     output_path = None
     try:
         with tempfile.NamedTemporaryFile(prefix="wonderpals_", suffix=".wav", delete=False) as wav_file:
             output_path = wav_file.name
-        # Voice models are downloaded during the Docker image build.
-        process = await __import__("asyncio").create_subprocess_exec(
-            "piper", "--model", voice_model, "--output_file", output_path,
-            stdin=__import__("asyncio").subprocess.PIPE,
-            stdout=__import__("asyncio").subprocess.PIPE,
-            stderr=__import__("asyncio").subprocess.PIPE,
-        )
-        _, stderr = await process.communicate(data.text.encode("utf-8"))
-        if process.returncode != 0 or not Path(output_path).exists() or Path(output_path).stat().st_size < 1000:
-            detail = stderr.decode("utf-8", errors="replace")[-500:]
-            raise RuntimeError(detail or "Piper nevarēja izveidot audio failu.")
+        await make_piper_wav(data.text, data.voice, output_path)
         return FileResponse(
             output_path, media_type="audio/wav", filename="wonderpals_story.wav",
             background=__import__("starlette.background", fromlist=["BackgroundTask"]).BackgroundTask(lambda: Path(output_path).unlink(missing_ok=True)),
         )
-    except FileNotFoundError:
-        if output_path:
-            Path(output_path).unlink(missing_ok=True)
-        return JSONResponse({"ok": False, "error": "Piper nav instalēts konteinerā. Pārbaudi Dockerfile."}, status_code=503)
     except Exception as exc:
         if output_path:
             Path(output_path).unlink(missing_ok=True)
         logger.exception("Piper speech generation failed")
         return JSONResponse({"ok": False, "error": f"Neizdevās izveidot balsi: {str(exc)[:300]}"}, status_code=502)
+
+
+@app.post("/video/create")
+async def video_create(
+    story: str = Form(...),
+    voice: str = Form("narrator"),
+    scenes: list[UploadFile] = File(...),
+):
+    """Create an MP4 from user-provided 3D stills, narration and licensed background music."""
+    work = Path(tempfile.mkdtemp(prefix="wonderpals_video_"))
+    try:
+        if not story.strip() or len(story) > 12000:
+            raise RuntimeError("Stāsts ir tukšs vai pārāk garš.")
+        if voice not in PIPER_VOICES:
+            raise RuntimeError("Izvēlētā balss nav derīga.")
+        valid_scenes = []
+        for idx, upload in enumerate(scenes[:12]):
+            suffix = Path(upload.filename or "scene.jpg").suffix.lower()
+            if suffix not in (".jpg", ".jpeg", ".png", ".webp"):
+                continue
+            target = work / f"scene_{idx:02d}{suffix}"
+            content = await upload.read()
+            if len(content) > 12 * 1024 * 1024:
+                continue
+            target.write_bytes(content)
+            if content:
+                valid_scenes.append(target)
+        if not valid_scenes:
+            raise RuntimeError("Pievieno vismaz vienu 3D ainas attēlu (JPG, PNG vai WEBP).")
+
+        voice_path = work / "narration.wav"
+        await make_piper_wav(story, voice, str(voice_path))
+        with wave.open(str(voice_path), "rb") as wf:
+            duration = wf.getnframes() / float(wf.getframerate())
+        duration = max(5.0, duration)
+        per_scene = duration / len(valid_scenes)
+        clip_paths = []
+        for idx, image_path in enumerate(valid_scenes):
+            clip = work / f"clip_{idx:02d}.mp4"
+            frames = max(150, int(math.ceil(per_scene * 30)))
+            vf = (
+                "scale=1600:900:force_original_aspect_ratio=increase,"
+                "crop=1600:900,setsar=1,"
+                f"zoompan=z='min(zoom+0.0007,1.12)':d={frames}:s=1280x720:fps=30,"
+                "format=yuv420p"
+            )
+            cmd = ["ffmpeg", "-y", "-loop", "1", "-i", str(image_path), "-vf", vf,
+                   "-t", f"{per_scene:.3f}", "-an", "-c:v", "libx264", "-preset", "veryfast",
+                   "-pix_fmt", "yuv420p", str(clip)]
+            proc = await __import__("asyncio").create_subprocess_exec(*cmd, stdout=__import__("asyncio").subprocess.PIPE, stderr=__import__("asyncio").subprocess.PIPE)
+            _, err = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError("FFmpeg nevarēja izveidot ainas video: " + err.decode(errors="replace")[-400:])
+            clip_paths.append(clip)
+
+        concat_file = work / "clips.txt"
+        concat_file.write_text("\n".join("file '" + str(x) + "'" for x in clip_paths), encoding="utf-8")
+        silent_video = work / "silent.mp4"
+        proc = await __import__("asyncio").create_subprocess_exec(
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(silent_video),
+            stdout=__import__("asyncio").subprocess.PIPE, stderr=__import__("asyncio").subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError("Neizdevās apvienot ainas: " + err.decode(errors="replace")[-400:])
+
+        music_path = Path("assets/music/background.mp3")
+        final_path = work / "wonderpals_video.mp4"
+        if music_path.exists():
+            audio_inputs = ["-i", str(voice_path), "-stream_loop", "-1", "-i", str(music_path)]
+            filter_complex = "[0:a]volume=1.0[voice];[1:a]volume=0.16[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+            cmd = ["ffmpeg", "-y", "-i", str(silent_video), *audio_inputs, "-filter_complex", filter_complex,
+                   "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                   "-shortest", "-movflags", "+faststart", str(final_path)]
+        else:
+            cmd = ["ffmpeg", "-y", "-i", str(silent_video), "-i", str(voice_path), "-map", "0:v:0", "-map", "1:a:0",
+                   "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(final_path)]
+        proc = await __import__("asyncio").create_subprocess_exec(*cmd, stdout=__import__("asyncio").subprocess.PIPE, stderr=__import__("asyncio").subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode != 0 or not final_path.exists():
+            raise RuntimeError("Neizdevās izveidot MP4: " + err.decode(errors="replace")[-500:])
+        from starlette.background import BackgroundTask
+        return FileResponse(str(final_path), media_type="video/mp4", filename="wonderpals_story.mp4", background=BackgroundTask(lambda: __import__("shutil").rmtree(work, ignore_errors=True)))
+    except Exception as exc:
+        logger.exception("Video creation failed")
+        __import__("shutil").rmtree(work, ignore_errors=True)
+        return JSONResponse({"ok": False, "error": str(exc)[:700]}, status_code=502)
 
 
 # ---------------------------------------------------------
@@ -467,6 +553,15 @@ async def home(request: Request):
     <button id="speak" onclick="makeAudio()">🎙️ Izveidot audio</button>
     <p id="audioMessage" class="muted">Audio tiek veidots tikai pēc pogas nospiešanas.</p>
     <audio id="audioPlayer" controls style="width:100%;display:none"></audio>
+    <hr>
+    <h3>🎬 Izveidot 3D stāsta video</h3>
+    <p class="muted">Pievieno 3D ainu attēlus (JPG, PNG vai WEBP). Video būs ar lēnu kameras kustību, stāstītāja balsi un, ja fails ir pieejams, fona mūziku.</p>
+    <label>3D ainu attēli (1–12)</label>
+    <input id="sceneImages" type="file" accept="image/jpeg,image/png,image/webp" multiple>
+    <button id="makeVideo" onclick="makeVideo()">🎬 Izveidot MP4 video</button>
+    <p id="videoMessage" class="muted">Vispirms ģenerē stāstu un pievieno tam atbilstošus 3D attēlus.</p>
+    <video id="videoPlayer" controls style="width:100%;display:none"></video>
+    <a id="videoDownload" style="display:none" download="wonderpals_story.mp4">Lejupielādēt MP4 video</a>
   </section>
   <script>
     async function checkYouTube(){
@@ -511,6 +606,28 @@ async def home(request: Request):
         message.textContent='Audio gatavs! Nospied atskaņošanas pogu.';
       }catch(error){message.textContent='Kļūda: '+error.message;}
       finally{button.disabled=false;}
+    }
+
+    async function makeVideo(){
+      const story=document.getElementById('story').textContent.trim();
+      const files=document.getElementById('sceneImages').files;
+      const button=document.getElementById('makeVideo');
+      const message=document.getElementById('videoMessage');
+      if(!story){message.textContent='Vispirms ģenerē stāstu.';return;}
+      if(!files.length){message.textContent='Pievieno vismaz vienu 3D ainas attēlu.';return;}
+      if(files.length>12){message.textContent='Pievieno ne vairāk kā 12 attēlus.';return;}
+      const form=new FormData();form.append('story',story);form.append('voice',document.getElementById('voice').value);
+      for(const file of files)form.append('scenes',file);
+      button.disabled=true;message.textContent='🎬 Veido video. Tas var aizņemt dažas minūtes...';
+      try{
+        const response=await fetch('/video/create',{method:'POST',body:form});
+        if(!response.ok){let err={};try{err=await response.json();}catch(e){}throw new Error(err.error||'Video izveide neizdevās');}
+        const blob=await response.blob();if(window.currentVideoUrl)URL.revokeObjectURL(window.currentVideoUrl);
+        window.currentVideoUrl=URL.createObjectURL(blob);
+        const player=document.getElementById('videoPlayer');player.src=window.currentVideoUrl;player.style.display='block';
+        const link=document.getElementById('videoDownload');link.href=window.currentVideoUrl;link.style.display='inline-block';
+        message.textContent='✅ Video gatavs! Pārbaudi to un lejupielādē MP4.';
+      }catch(error){message.textContent='Kļūda: '+error.message;}finally{button.disabled=false;}
     }
 
     async function makeStory(){

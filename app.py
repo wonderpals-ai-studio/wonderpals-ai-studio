@@ -120,8 +120,9 @@ def oauth_callback(request: Request):
 
     try:
         flow = create_flow(state=saved_state)
-        flow.fetch_token(authorization_response=str(request.url))
-
+       flow.fetch_token(
+    authorization_response=f"{flow.redirect_uri}?{request.url.query}"
+)
         credentials = flow.credentials
 
         if not credentials.refresh_token:

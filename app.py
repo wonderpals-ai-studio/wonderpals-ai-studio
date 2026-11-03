@@ -1,3 +1,195 @@
+import os
+import json
+import logging
+from typing import Optional
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from starlette.middleware.sessions import SessionMiddleware
+from pydantic import BaseModel, Field
+from google_auth_oauthlib.flow import Flow
+from google.cloud import secretmanager
+
+
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("wonderpals")
+
+app = FastAPI(title="WonderPals AI Studio")
+
+SESSION_SECRET = os.getenv("SESSION_SECRET")
+if not SESSION_SECRET:
+    logger.warning("SESSION_SECRET is not configured; using an unsafe fallback.")
+    SESSION_SECRET = "replace-this-session-secret"
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    same_site="lax",
+    https_only=True,
+)
+
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "wonderpals-ai-studio-513606")
+CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI",
+    "https://wonderpals-ai-studio-138820800509.europe-north1.run.app/oauth2callback",
+)
+YOUTUBE_TOKEN_SECRET = os.getenv("YOUTUBE_TOKEN_SECRET", "youtube-oauth-token")
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+HF_MODEL = os.getenv("HF_MODEL", "google/gemma-2-2b-it:cheapest")
+HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
+
+YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+
+
+# ---------------------------------------------------------
+# GOOGLE / YOUTUBE OAUTH
+# ---------------------------------------------------------
+
+def create_oauth_flow(state: Optional[str] = None,
+                      code_verifier: Optional[str] = None) -> Flow:
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise RuntimeError(
+            "Google OAuth is not configured. Set GOOGLE_CLIENT_ID "
+            "and GOOGLE_CLIENT_SECRET in Cloud Run."
+        )
+
+    client_config = {
+        "web": {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [REDIRECT_URI],
+        }
+    }
+
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=YOUTUBE_SCOPES,
+        state=state,
+        code_verifier=code_verifier,
+        autogenerate_code_verifier=(code_verifier is None),
+    )
+    flow.redirect_uri = REDIRECT_URI
+    return flow
+
+
+def save_youtube_token(credentials) -> None:
+    """Store OAuth credentials as a new Secret Manager secret version."""
+    client = secretmanager.SecretManagerServiceClient()
+    parent = f"projects/{PROJECT_ID}/secrets/{YOUTUBE_TOKEN_SECRET}"
+    payload = credentials.to_json().encode("utf-8")
+    client.add_secret_version(
+        request={"parent": parent, "payload": {"data": payload}}
+    )
+
+
+@app.get("/auth/login")
+async def auth_login(request: Request):
+    try:
+        flow = create_oauth_flow()
+        authorization_url, state = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+        request.session["oauth_state"] = state
+        request.session["oauth_code_verifier"] = flow.code_verifier
+        return RedirectResponse(authorization_url, status_code=302)
+    except Exception:
+        logger.exception("Could not start Google OAuth")
+        return HTMLResponse(
+            "Google autorizācija nav konfigurēta. Pārbaudi Cloud Run OAuth iestatījumus.",
+            status_code=500,
+        )
+
+
+@app.get("/oauth2callback")
+async def oauth_callback(request: Request):
+    state = request.session.get("oauth_state")
+    code_verifier = request.session.get("oauth_code_verifier")
+
+    if not state:
+        return HTMLResponse(
+            "Autorizācijas sesija beigusies. Atgriezies sākumlapā un mēģini vēlreiz.",
+            status_code=400,
+        )
+
+    try:
+        flow = create_oauth_flow(state=state, code_verifier=code_verifier)
+        flow.fetch_token(authorization_response=str(request.url))
+        save_youtube_token(flow.credentials)
+        request.session.pop("oauth_state", None)
+        request.session.pop("oauth_code_verifier", None)
+        request.session["youtube_connected"] = True
+        return RedirectResponse("/", status_code=303)
+    except Exception:
+        logger.exception("Google OAuth callback failed")
+        return HTMLResponse(
+            "Neizdevās saglabāt YouTube autorizāciju. Pārbaudi Cloud Run žurnālus.",
+            status_code=500,
+        )
+
+
+# ---------------------------------------------------------
+# HUGGING FACE STORY GENERATION
+# ---------------------------------------------------------
+
+class StoryRequest(BaseModel):
+    topic: str = Field(default="A friendly adventure", min_length=3, max_length=160)
+    age_group: str = Field(default="All children", max_length=60)
+    language: str = Field(default="English", max_length=40)
+    duration_minutes: int = Field(default=3, ge=1, le=10)
+
+
+async def generate_story(data: StoryRequest) -> str:
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN is not configured in Cloud Run.")
+
+    system_prompt = (
+        "You are a kind, imaginative writer of original stories for children. "
+        "Keep the story age-appropriate, gentle, positive, inclusive, and safe. "
+        "Avoid frightening, violent, sexual, hateful, or dangerous content. "
+        "Use simple language and finish with a warm, reassuring ending."
+    )
+    user_prompt = (
+        f"Write an original children's story in {data.language}. "
+        f"Audience: {data.age_group}. Topic: {data.topic}. "
+        f"Target length: about {data.duration_minutes} minutes when read aloud. "
+        "Give it a short title. Return only the title and story."
+    )
+
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": HF_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.8,
+        "max_tokens": 1800,
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(HF_CHAT_URL, headers=headers, json=payload)
+
+    if response.status_code >= 400:
+        # Log only status and a short provider response; never log the token.
+        logger.error("Hugging Face request failed: HTTP %s: %s",
+                     response.status_code, response.text[:1000])
+        raise RuntimeError(
+            f"Hugging Face API returned HTTP {response.status_code}. "
             "Check HF access, model availability, and provider credits."
         )
 
@@ -126,3 +318,11 @@ async def home(request: Request):
       }catch(error){
         message.textContent='Kļūda: '+error.message;
       }finally{
+        button.disabled=false;
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+    return HTMLResponse(html.replace("__YT_STATUS__", youtube_status))

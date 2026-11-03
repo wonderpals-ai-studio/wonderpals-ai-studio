@@ -1,7 +1,6 @@
 
 import os
 import logging
-import traceback
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -20,16 +19,13 @@ logger = logging.getLogger("wonderpals")
 
 
 # --------------------------------------------------
-# GOOGLE CLOUD SETTINGS
+# SETTINGS
 # --------------------------------------------------
 
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
-
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
-
 SESSION_SECRET = os.getenv("SESSION_SECRET")
 
 TOKEN_SECRET = os.getenv(
@@ -49,10 +45,7 @@ SCOPES = [
 if not SESSION_SECRET:
     raise RuntimeError("SESSION_SECRET nav konfigurēts.")
 
-app = FastAPI(
-    title="WonderPals AI Studio",
-    version="1.0.0"
-)
+app = FastAPI(title="WonderPals AI Studio")
 
 app.add_middleware(
     SessionMiddleware,
@@ -68,76 +61,71 @@ app.add_middleware(
 # --------------------------------------------------
 
 def page(title, message, success=False):
+
     color = "#16a34a" if success else "#dc2626"
 
-    return HTMLResponse(
-        f"""
-        <!DOCTYPE html>
-        <html lang="lv">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>{title}</title>
-            <style>
-                body {{
-                    background: #101827;
-                    color: white;
-                    font-family: Arial, sans-serif;
-                    text-align: center;
-                    padding: 50px 20px;
-                }}
-                .card {{
-                    max-width: 550px;
-                    margin: auto;
-                    padding: 30px;
-                    background: #1e293b;
-                    border-radius: 16px;
-                }}
-                a {{
-                    display: inline-block;
-                    margin-top: 20px;
-                    padding: 14px 22px;
-                    background: #2563eb;
-                    color: white;
-                    text-decoration: none;
-                    border-radius: 8px;
-                }}
-                .status {{
-                    color: {color};
-                    font-weight: bold;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="card">
-                <h1>WonderPals AI Studio</h1>
-                <h2>{title}</h2>
-                <p class="status">{message}</p>
-                <a href="/">Atpakaļ uz sākumu</a>
-            </div>
-        </body>
-        </html>
-        """
-    )
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html lang="lv">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>{title}</title>
+        <style>
+            body {{
+                background: #101827;
+                color: white;
+                font-family: Arial, sans-serif;
+                text-align: center;
+                padding: 50px 20px;
+            }}
+            .card {{
+                max-width: 550px;
+                margin: auto;
+                padding: 30px;
+                background: #1e293b;
+                border-radius: 16px;
+            }}
+            .status {{
+                color: {color};
+                font-weight: bold;
+            }}
+            a {{
+                display: inline-block;
+                margin-top: 20px;
+                padding: 14px 22px;
+                background: #2563eb;
+                color: white;
+                text-decoration: none;
+                border-radius: 8px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>🌈 WonderPals AI Studio</h1>
+            <h2>{title}</h2>
+            <p class="status">{message}</p>
+            <a href="/">Atpakaļ uz sākumu</a>
+        </div>
+    </body>
+    </html>
+    """)
 
 
 # --------------------------------------------------
 # GOOGLE OAUTH FLOW
 # --------------------------------------------------
 
-def create_oauth_flow(state=None):
+def create_oauth_flow(state=None, code_verifier=None):
 
-    if not CLIENT_ID:
-        raise RuntimeError("Trūkst GOOGLE_CLIENT_ID.")
-
-    if not CLIENT_SECRET:
-        raise RuntimeError("Trūkst GOOGLE_CLIENT_SECRET.")
-
-    if not REDIRECT_URI:
-        raise RuntimeError("Trūkst GOOGLE_REDIRECT_URI.")
-
-    if not PROJECT_ID:
-        raise RuntimeError("Trūkst GOOGLE_CLOUD_PROJECT.")
+    if not all([
+        PROJECT_ID,
+        CLIENT_ID,
+        CLIENT_SECRET,
+        REDIRECT_URI
+    ]):
+        raise RuntimeError("Trūkst Google OAuth konfigurācijas.")
 
     client_config = {
         "web": {
@@ -152,7 +140,9 @@ def create_oauth_flow(state=None):
     flow = Flow.from_client_config(
         client_config,
         scopes=SCOPES,
-        state=state
+        state=state,
+        code_verifier=code_verifier,
+        autogenerate_code_verifier=(code_verifier is None)
     )
 
     flow.redirect_uri = REDIRECT_URI
@@ -167,52 +157,50 @@ def create_oauth_flow(state=None):
 @app.get("/", response_class=HTMLResponse)
 async def home():
 
-    return HTMLResponse(
-        """
-        <!DOCTYPE html>
-        <html lang="lv">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>WonderPals AI Studio</title>
-            <style>
-                body {
-                    background: #101827;
-                    color: white;
-                    font-family: Arial, sans-serif;
-                    text-align: center;
-                    padding: 50px 20px;
-                }
-                .card {
-                    max-width: 600px;
-                    margin: auto;
-                    padding: 35px;
-                    background: #1e293b;
-                    border-radius: 16px;
-                }
-                a {
-                    display: inline-block;
-                    margin-top: 20px;
-                    padding: 15px 25px;
-                    background: #2563eb;
-                    color: white;
-                    text-decoration: none;
-                    border-radius: 8px;
-                    font-weight: bold;
-                }
-            </style>
-        </head>
-        <body>
-            <div class="card">
-                <h1>🌈 WonderPals AI Studio</h1>
-                <p>Automatizēta bērnu YouTube kanāla platforma.</p>
-                <p>Pašlaik konfigurējam YouTube savienojumu.</p>
-                <a href="/auth/login">Pieslēgt YouTube kontu</a>
-            </div>
-        </body>
-        </html>
-        """
-    )
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html lang="lv">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>WonderPals AI Studio</title>
+        <style>
+            body {
+                background: #101827;
+                color: white;
+                font-family: Arial, sans-serif;
+                text-align: center;
+                padding: 50px 20px;
+            }
+            .card {
+                max-width: 600px;
+                margin: auto;
+                padding: 35px;
+                background: #1e293b;
+                border-radius: 16px;
+            }
+            a {
+                display: inline-block;
+                margin-top: 20px;
+                padding: 15px 25px;
+                background: #2563eb;
+                color: white;
+                text-decoration: none;
+                border-radius: 8px;
+                font-weight: bold;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>🌈 WonderPals AI Studio</h1>
+            <p>Automatizēta bērnu YouTube kanāla platforma.</p>
+            <p>YouTube konta savienojuma iestatīšana.</p>
+            <a href="/auth/login">Pieslēgt YouTube kontu</a>
+        </div>
+    </body>
+    </html>
+    """)
 
 
 # --------------------------------------------------
@@ -244,7 +232,9 @@ async def auth_login(request: Request):
             prompt="consent"
         )
 
+        # Saglabājam abus datus nākamajam solim.
         request.session["oauth_state"] = state
+        request.session["oauth_code_verifier"] = flow.code_verifier
 
         return RedirectResponse(
             authorization_url,
@@ -256,7 +246,7 @@ async def auth_login(request: Request):
 
         return page(
             "Autorizācija neizdevās",
-            "Pārbaudi Google Cloud iestatījumus un slepenos datus."
+            "Neizdevās sākt Google autorizāciju."
         )
 
 
@@ -268,28 +258,29 @@ async def auth_login(request: Request):
 async def oauth_callback(request: Request):
 
     try:
-        oauth_error = request.query_params.get("error")
-
-        if oauth_error:
-            logger.error("Google OAuth atgrieza kļūdu: %s", oauth_error)
+        if request.query_params.get("error"):
+            logger.error("Google autorizācija tika atteikta.")
 
             return page(
-                "Autorizācija tika pārtraukta",
+                "Autorizācija pārtraukta",
                 "Google konta autorizācija netika pabeigta."
             )
 
         state = request.session.get("oauth_state")
+        code_verifier = request.session.get("oauth_code_verifier")
 
-        if not state:
+        if not state or not code_verifier:
             return page(
                 "Sesija beigusies",
-                "Lūdzu, mēģini pieslēgt kontu vēlreiz."
+                "Drošības dati nav pieejami. Sāc autorizāciju vēlreiz."
             )
 
-        flow = create_oauth_flow(state=state)
+        # Atjaunojam iepriekš saglabāto PKCE verifier.
+        flow = create_oauth_flow(
+            state=state,
+            code_verifier=code_verifier
+        )
 
-        # Izmantojam konfigurēto HTTPS adresi,
-        # nevis Cloud Run iekšējo HTTP adresi.
         authorization_response = (
             f"{REDIRECT_URI}?{request.url.query}"
         )
@@ -301,11 +292,9 @@ async def oauth_callback(request: Request):
         credentials = flow.credentials
 
         if not credentials.refresh_token:
-            logger.warning(
-                "Google neatgrieza refresh token."
-            )
+            logger.warning("Google neatgrieza refresh token.")
 
-        # Saglabājam OAuth datus Google Secret Manager.
+        # Saglabājam OAuth datus Secret Manager.
         client = secretmanager.SecretManagerServiceClient()
 
         parent = (
@@ -325,13 +314,11 @@ async def oauth_callback(request: Request):
 
         request.session.clear()
 
-        logger.info(
-            "YouTube OAuth autorizācija veiksmīgi saglabāta."
-        )
+        logger.info("YouTube OAuth autorizācija veiksmīgi saglabāta.")
 
         return page(
             "Google konts veiksmīgi pieslēgts!",
-            "YouTube autorizācija ir saglabāta Google Secret Manager.",
+            "YouTube autorizācija ir saglabāta.",
             success=True
         )
 
@@ -340,7 +327,7 @@ async def oauth_callback(request: Request):
 
         return page(
             "Autorizācija neizdevās",
-            "Pārbaudi Cloud Run žurnālus, Secret Manager un OAuth iestatījumus."
+            "Pārbaudi Cloud Run žurnālus un Google iestatījumus."
         )
 
 

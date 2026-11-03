@@ -168,15 +168,26 @@ class StoryRequest(BaseModel):
 
 
 def generate_story(idea: str, age: str, length: str) -> str:
-    if not GEMINI_API_KEY:
-        raise RuntimeError("Gemini API key is not configured.")
+    import os
+    import json
+    import urllib.request
+    import urllib.error
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    hf_token = os.getenv("HF_TOKEN")
+
+    if not hf_token:
+        raise RuntimeError("Hugging Face token is not configured.")
 
     length_instructions = {
         "short": "About 250-350 words.",
         "medium": "About 500-700 words.",
         "long": "About 900-1200 words.",
+    }
+
+    max_tokens = {
+        "short": 650,
+        "medium": 1100,
+        "long": 1800,
     }
 
     prompt = f"""
@@ -208,39 +219,53 @@ IMPORTANT RULES:
 - Do not include production notes or explanations outside the story.
 """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
+    payload = {
+        "model": "google/gemma-2-2b-it:fastest",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You write safe, original children's stories."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "max_tokens": max_tokens[length],
+        "temperature": 0.8
+    }
+
+    request = urllib.request.Request(
+        "https://router.huggingface.co/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {hf_token}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
     )
 
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response.")
-
-    return response.text.strip()
-
-
-@app.post("/story/generate")
-async def story_generate(data: StoryRequest):
     try:
-        story = await run_in_threadpool(
-            generate_story,
-            data.idea,
-            data.age,
-            data.length,
-        )
+        with urllib.request.urlopen(request, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
-        return JSONResponse({"success": True, "story": story})
+        story = result["choices"][0]["message"]["content"]
 
-    except Exception:
-        logger.exception("Story generation failed.")
-        return JSONResponse(
-            {
-                "success": False,
-                "error": "Neizdevās izveidot stāstu. Pārbaudi Gemini API konfigurāciju un limitus.",
-            },
-            status_code=500,
-        )
+        if not story or not story.strip():
+            raise RuntimeError("Hugging Face returned an empty story.")
 
+        return story.strip()
+
+    except urllib.error.HTTPError as error:
+        error_body = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Hugging Face API error {error.code}: {error_body[:1000]}"
+        ) from None
+
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f"Could not connect to Hugging Face: {error.reason}"
+        ) from None
 
 # -----------------------------
 # GALVENĀ LAPA

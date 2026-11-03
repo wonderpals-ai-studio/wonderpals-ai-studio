@@ -17,5 +17,7 @@ RUN mkdir -p /voices && \
       en_US-lessac-medium en_US-amy-medium en_US-ryan-high
 
 COPY app.py .
+COPY assets ./assets
+
 ENV PORT=8080
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]

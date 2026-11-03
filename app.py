@@ -10,6 +10,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
 from google_auth_oauthlib.flow import Flow
 from google.cloud import secretmanager
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 
 # ---------------------------------------------------------
@@ -90,6 +92,74 @@ def save_youtube_token(credentials) -> None:
     )
 
 
+def load_youtube_credentials() -> Credentials:
+    """Load the saved OAuth credentials from Secret Manager."""
+    client = secretmanager.SecretManagerServiceClient()
+    name = (
+        f"projects/{PROJECT_ID}/secrets/{YOUTUBE_TOKEN_SECRET}/versions/latest"
+    )
+    result = client.access_secret_version(request={"name": name})
+    info = json.loads(result.payload.data.decode("utf-8"))
+    return Credentials.from_authorized_user_info(info, scopes=YOUTUBE_SCOPES)
+
+
+async def verify_youtube_connection() -> dict:
+    """Refresh the saved token if needed and verify it against YouTube."""
+    credentials = load_youtube_credentials()
+
+    if not credentials.valid:
+        if not credentials.refresh_token:
+            raise RuntimeError("Saglabātajam tokenam nav refresh_token.")
+        credentials.refresh(GoogleAuthRequest())
+        # Keep the refreshed token in Secret Manager.
+        save_youtube_token(credentials)
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(
+            "https://www.googleapis.com/youtube/v3/channels",
+            params={"part": "snippet", "mine": "true"},
+            headers={"Authorization": f"Bearer {credentials.token}"},
+        )
+
+    if response.status_code == 401:
+        raise RuntimeError("YouTube noraidīja tokenu (401). Nepieciešama atkārtota autorizācija.")
+    if response.status_code == 403:
+        raise RuntimeError("YouTube API piekļuve ir liegta (403). Pārbaudi YouTube Data API v3 un konta atļaujas.")
+    response.raise_for_status()
+
+    data = response.json()
+    channels = data.get("items", [])
+    if not channels:
+        raise RuntimeError("Tokens darbojas, bet šim Google kontam nav atrasts YouTube kanāls.")
+
+    channel = channels[0].get("snippet", {})
+    return {
+        "ok": True,
+        "channel_title": channel.get("title", "YouTube kanāls"),
+        "message": "YouTube savienojums darbojas.",
+    }
+
+
+@app.get("/youtube/status")
+async def youtube_status(request: Request):
+    # This endpoint verifies the saved token with the actual YouTube API.
+    try:
+        result = await verify_youtube_connection()
+        request.session["youtube_connected"] = True
+        return JSONResponse(result)
+    except Exception as exc:
+        request.session["youtube_connected"] = False
+        logger.error(
+            "YouTube connection verification failed (%s).",
+            type(exc).__name__,
+            exc_info=True,
+        )
+        return JSONResponse(
+            {"ok": False, "message": str(exc)},
+            status_code=200,
+        )
+
+
 @app.get("/auth/login")
 async def auth_login(request: Request):
     try:
@@ -111,55 +181,23 @@ async def auth_login(request: Request):
 
 @app.get("/oauth2callback")
 async def oauth_callback(request: Request):
-    # Read the state saved when /auth/login started. Compare it with the
-    # state returned by Google before exchanging the one-time authorization code.
-    expected_state = request.session.get("oauth_state")
-    returned_state = request.query_params.get("state")
-    code = request.query_params.get("code")
-    oauth_error = request.query_params.get("error")
+    state = request.session.get("oauth_state")
 
-    if oauth_error:
-        logger.warning("Google OAuth was not completed; provider returned an error.")
+    if not state:
         return HTMLResponse(
-            "Google autorizācija tika atcelta vai noraidīta. Atgriezies sākumlapā un mēģini vēlreiz.",
-            status_code=400,
-        )
-
-    if not expected_state or not returned_state or expected_state != returned_state:
-        logger.warning("Google OAuth state validation failed.")
-        return HTMLResponse(
-            "Autorizācijas sesija nav derīga vai ir beigusies. Atgriezies sākumlapā un mēģini vēlreiz.",
-            status_code=400,
-        )
-
-    if not code:
-        logger.warning("Google OAuth callback did not contain an authorization code.")
-        return HTMLResponse(
-            "Google neatgrieza autorizācijas kodu. Atgriezies sākumlapā un mēģini vēlreiz.",
+            "Autorizācijas sesija beigusies. Atgriezies sākumlapā un mēģini vēlreiz.",
             status_code=400,
         )
 
     try:
-        # PKCE is intentionally disabled in create_oauth_flow(). Pass the
-        # authorization code directly so OAuthlib does not need to parse the
-        # complete callback URL or look for a code_verifier in that URL.
-        flow = create_oauth_flow(state=expected_state)
-        flow.fetch_token(code=code)
-
-        # Save first; only mark the browser session connected after Secret
-        # Manager confirms that a new secret version was created.
+        flow = create_oauth_flow(state=state)
+        flow.fetch_token(authorization_response=str(request.url))
         save_youtube_token(flow.credentials)
-
         request.session.pop("oauth_state", None)
         request.session["youtube_connected"] = True
         return RedirectResponse("/", status_code=303)
-    except Exception as exc:
-        # Do not log the callback URL, authorization code, or credentials.
-        logger.error(
-            "Google OAuth callback/token storage failed (%s).",
-            type(exc).__name__,
-            exc_info=True,
-        )
+    except Exception:
+        logger.exception("Google OAuth callback failed")
         return HTMLResponse(
             "Neizdevās saglabāt YouTube autorizāciju. Pārbaudi Cloud Run žurnālus.",
             status_code=500,
@@ -293,8 +331,10 @@ async def home(request: Request):
   <section class="card">
     <h2>📺 YouTube savienojums</h2>
     <p id="ytstatus">__YT_STATUS__</p>
+    <button type="button" id="checkYoutube" onclick="checkYouTube()">Pārbaudīt YouTube savienojumu</button>
+    <p id="ytcheckresult" class="muted">Vēl nav veikta tokena pārbaude.</p>
     <a href="/auth/login">Savienot Google / YouTube kontu</a>
-    <p class="muted">Autorizācija ļauj sagatavot piekļuvi YouTube augšupielādei.
+    <p class="muted">Pārbaude sazinās ar YouTube API un pārbauda saglabāto tokenu.
     Šī versija pati video nepublicē.</p>
   </section>
   <section class="card">
@@ -320,6 +360,31 @@ async def home(request: Request):
     <pre id="story"></pre>
   </section>
   <script>
+    async function checkYouTube(){
+      const button=document.getElementById('checkYoutube');
+      const result=document.getElementById('ytcheckresult');
+      button.disabled=true;
+      result.textContent='Pārbauda saglabāto tokenu YouTube...';
+      try{
+        const response=await fetch('/youtube/status');
+        const data=await response.json();
+        if(data.ok){
+          result.textContent='✅ SAVIENOJUMS DARBOJAS — kanāls: '+data.channel_title;
+          result.style.color='green';
+          document.getElementById('ytstatus').textContent='YouTube savienojums pārbaudīts un darbojas';
+        }else{
+          result.textContent='❌ SAVIENOJUMS NEDARBOJAS — '+data.message;
+          result.style.color='crimson';
+          document.getElementById('ytstatus').textContent='YouTube savienojums nav pārbaudīts vai nedarbojas';
+        }
+      }catch(error){
+        result.textContent='❌ Pārbaudes kļūda: '+error.message;
+        result.style.color='crimson';
+      }finally{
+        button.disabled=false;
+      }
+    }
+
     async function makeStory(){
       const button=document.getElementById('generate');
       const message=document.getElementById('message');

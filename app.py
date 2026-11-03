@@ -48,7 +48,10 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 HF_MODEL = os.getenv("HF_MODEL", "google/gemma-2-2b-it:cheapest")
 HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 
-YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+YOUTUBE_SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.readonly",
+]
 
 
 # ---------------------------------------------------------
@@ -124,7 +127,18 @@ async def verify_youtube_connection() -> dict:
     if response.status_code == 401:
         raise RuntimeError("YouTube noraidīja tokenu (401). Nepieciešama atkārtota autorizācija.")
     if response.status_code == 403:
-        raise RuntimeError("YouTube API piekļuve ir liegta (403). Pārbaudi YouTube Data API v3 un konta atļaujas.")
+        # YouTube returns a structured reason such as insufficientPermissions,
+        # quotaExceeded, or accessNotConfigured. Keep the diagnostic bounded.
+        try:
+            error_info = response.json().get("error", {})
+            details = error_info.get("errors", [])
+            reason = details[0].get("reason", "unknown") if details else "unknown"
+            message = error_info.get("message", "YouTube API denied the request.")
+        except (ValueError, AttributeError, TypeError):
+            reason = "unknown"
+            message = "YouTube API denied the request."
+        logger.error("YouTube API returned 403; reason=%s; message=%s", reason, message[:500])
+        raise RuntimeError(f"YouTube API 403 ({reason}): {message[:300]}")
     response.raise_for_status()
 
     data = response.json()

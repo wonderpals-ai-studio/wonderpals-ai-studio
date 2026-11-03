@@ -1,192 +1,96 @@
-            "Autorizācijas sesija beigusies. Lūdzu, mēģini vēlreiz.",
-            status_code=400,
-        )
 
-    try:
-        flow = create_oauth_flow(
-            state=state,
-            code_verifier=code_verifier,
-        )
+import os
+import json
+import logging
+from urllib.parse import urlencode
 
-        flow.fetch_token(code=request.query_params.get("code"))
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
 
-        save_youtube_token(flow.credentials)
-
-        request.session["youtube_connected"] = True
-        request.session.pop("oauth_state", None)
-        request.session.pop("oauth_code_verifier", None)
-
-        return RedirectResponse("/")
-
-    except Exception:
-        logger.exception("YouTube OAuth callback failed.")
-        return HTMLResponse(
-            "Neizdevās saglabāt YouTube autorizāciju. Pārbaudi Cloud Run žurnālus.",
-            status_code=500,
-        )
+from google_auth_oauthlib.flow import Flow
+from google.cloud import secretmanager
 
 
 # -----------------------------
-# STĀSTU ĢENERĒŠANA (HUGGING FACE)
+# KONFIGURĀCIJA
 # -----------------------------
 
-class StoryRequest(BaseModel):
-    idea: str = Field(min_length=3, max_length=500)
-    age: str = Field(pattern=r"^(3-5|6-8|9-12)$")
-    length: str = Field(pattern=r"^(short|medium|long)$")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET", "change-this-secret-before-production"),
+    same_site="lax",
+    https_only=True,
+)
+
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "wonderpals-ai-studio-513606")
+CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI",
+    "https://wonderpals-ai-studio-138820800509.europe-north1.run.app/oauth2callback",
+)
+
+YOUTUBE_TOKEN_SECRET = os.getenv("YOUTUBE_TOKEN_SECRET", "youtube-oauth-token")
+
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
-def generate_story(idea: str, age: str, length: str) -> str:
-    import os
-    import json
-    import urllib.request
-    import urllib.error
+# -----------------------------
+# GOOGLE YOUTUBE OAUTH
+# -----------------------------
 
-    hf_token = os.getenv("HF_TOKEN")
+def create_oauth_flow(state=None, code_verifier=None):
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise RuntimeError("Google OAuth credentials are not configured.")
 
-    if not hf_token:
-        raise RuntimeError("Hugging Face token is not configured.")
-
-    length_instructions = {
-        "short": "About 250-350 words.",
-        "medium": "About 500-700 words.",
-        "long": "About 900-1200 words.",
+    client_config = {
+        "web": {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [REDIRECT_URI],
+        }
     }
 
-    max_tokens = {
-        "short": 650,
-        "medium": 1100,
-        "long": 1800,
-    }
-
-    prompt = f"""
-You are the children's story writer for WonderPals AI Studio.
-
-Write a completely original, delightful story in English.
-
-STORY IDEA:
-{idea}
-
-TARGET AGE:
-{age} years old.
-
-LENGTH:
-{length_instructions[length]}
-
-IMPORTANT RULES:
-- Make the story suitable for the specified age group.
-- Use original characters and original settings.
-- Keep the story positive, kind, imaginative and entertaining.
-- No graphic violence, frightening scenes, dangerous instructions,
-  inappropriate content or adult themes.
-- Do not use copyrighted characters or imitate existing franchises.
-- Include a clear beginning, middle and satisfying ending.
-- Include a gentle positive lesson without sounding preachy.
-- Use simple language appropriate for the target age.
-- Do not ask children for personal information.
-- Output a title followed by the complete narration.
-- Do not include production notes or explanations outside the story.
-"""
-
-    payload = {
-        "model": "google/gemma-2-2b-it:cheapest",
-        "messages": [
-            {
-                "role": "system",
-                "content": "You write safe, original children's stories."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "max_tokens": max_tokens[length],
-        "temperature": 0.8
-    }
-
-    request = urllib.request.Request(
-        "https://router.huggingface.co/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {hf_token}",
-            "Content-Type": "application/json"
-        },
-        method="POST"
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        state=state,
+        code_verifier=code_verifier,
+        autogenerate_code_verifier=(code_verifier is None),
     )
 
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            result = json.loads(response.read().decode("utf-8"))
-
-        story = result["choices"][0]["message"]["content"]
-
-        if not story or not story.strip():
-            raise RuntimeError("Hugging Face returned an empty story.")
-
-        return story.strip()
-
-    except urllib.error.HTTPError as error:
-        error_body = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Hugging Face API error {error.code}: {error_body[:1000]}"
-        ) from None
-
-    except urllib.error.URLError as error:
-        raise RuntimeError(
-            f"Could not connect to Hugging Face: {error.reason}"
-        ) from None
+    flow.redirect_uri = REDIRECT_URI
+    return flow
 
 
-@app.post("/story/generate")
-async def story_generate(data: StoryRequest):
-    """Generate one story without blocking the web server's event loop."""
-    try:
-        story = await run_in_threadpool(
-            generate_story,
-            data.idea,
-            data.age,
-            data.length,
-        )
-        return JSONResponse({"success": True, "story": story})
-    except Exception:
-        # Keep credentials/provider details out of the public browser response.
-        logger.exception("Hugging Face story generation failed.")
-        return JSONResponse(
-            {
-                "success": False,
-                "error": "Neizdevās izveidot stāstu. Pārbaudi Hugging Face piekļuvi un bezmaksas kvotu.",
-            },
-            status_code=500,
-        )
+def save_youtube_token(credentials):
+    client = secretmanager.SecretManagerServiceClient()
 
-# -----------------------------
-# GALVENĀ LAPA
-# -----------------------------
+    parent = f"projects/{PROJECT_ID}/secrets/{YOUTUBE_TOKEN_SECRET}"
 
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    connected = request.session.get("youtube_connected", False)
+    payload = credentials.to_json().encode("UTF-8")
 
-    youtube_status = (
-        "✅ YouTube konts veiksmīgi pieslēgts!"
-        if connected
-        else "YouTube konts vēl nav pieslēgts."
+    client.add_secret_version(
+        request={
+            "parent": parent,
+            "payload": {"data": payload},
+        }
     )
 
-    html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WonderPals AI Studio</title>
-<style>
-body {
-    margin: 0;
-    padding: 30px 15px;
-    background: #f1f4ff;
-    color: #252747;
-    font-family: Arial, sans-serif;
-}
-.container {
-    max-width: 850px;
+
+@app.get("/auth/login")
+async def auth_login(request: Request):
+    try:
+        flow = create_oauth_flow()
+
+        authorization_url, state = flow.authorization_url(

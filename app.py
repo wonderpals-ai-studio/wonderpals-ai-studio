@@ -53,9 +53,9 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 PIPER_ENABLED = os.getenv("PIPER_ENABLED", "true").lower() == "true"
 PIPER_VOICES = {
-    "narrator": "en_US-lessac-medium",
-    "rabbit": "en_US-amy-medium",
-    "turtle": "en_US-ryan-high",
+    "narrator": "/voices/en_US-lessac-medium.onnx",
+    "rabbit": "/voices/en_US-amy-medium.onnx",
+    "turtle": "/voices/en_US-ryan-high.onnx",
 }
 
 YOUTUBE_SCOPES = [
@@ -355,7 +355,7 @@ async def speech_generate(data: SpeechRequest):
     try:
         with tempfile.NamedTemporaryFile(prefix="wonderpals_", suffix=".wav", delete=False) as wav_file:
             output_path = wav_file.name
-        # Piper downloads the selected voice on first use and reuses it afterwards.
+        # Voice models are downloaded during the Docker image build.
         process = await __import__("asyncio").create_subprocess_exec(
             "piper", "--model", voice_model, "--output_file", output_path,
             stdin=__import__("asyncio").subprocess.PIPE,

@@ -195,23 +195,51 @@ async def auth_login(request: Request):
 
 @app.get("/oauth2callback")
 async def oauth_callback(request: Request):
-    state = request.session.get("oauth_state")
+    # Validate the OAuth state stored when /auth/login was started.
+    expected_state = request.session.get("oauth_state")
+    returned_state = request.query_params.get("state")
+    code = request.query_params.get("code")
+    oauth_error = request.query_params.get("error")
 
-    if not state:
+    if oauth_error:
+        logger.warning("Google OAuth was not completed; provider returned an error.")
         return HTMLResponse(
-            "Autorizācijas sesija beigusies. Atgriezies sākumlapā un mēģini vēlreiz.",
+            "Google autorizācija tika atcelta vai noraidīta. Atgriezies sākumlapā un mēģini vēlreiz.",
+            status_code=400,
+        )
+
+    if not expected_state or not returned_state or expected_state != returned_state:
+        logger.warning("Google OAuth state validation failed.")
+        return HTMLResponse(
+            "Autorizācijas sesija nav derīga vai ir beigusies. Atgriezies sākumlapā un mēģini vēlreiz.",
+            status_code=400,
+        )
+
+    if not code:
+        logger.warning("Google OAuth callback did not contain an authorization code.")
+        return HTMLResponse(
+            "Google neatgrieza autorizācijas kodu. Atgriezies sākumlapā un mēģini vēlreiz.",
             status_code=400,
         )
 
     try:
-        flow = create_oauth_flow(state=state)
-        flow.fetch_token(authorization_response=str(request.url))
+        # PKCE is disabled in create_oauth_flow(); exchange the code directly.
+        # This avoids parsing the full callback URL and looking for a verifier.
+        flow = create_oauth_flow(state=expected_state)
+        flow.fetch_token(code=code)
+
+        # Mark the session connected only after Secret Manager saves the token.
         save_youtube_token(flow.credentials)
         request.session.pop("oauth_state", None)
         request.session["youtube_connected"] = True
         return RedirectResponse("/", status_code=303)
-    except Exception:
-        logger.exception("Google OAuth callback failed")
+    except Exception as exc:
+        # Never log the callback URL, authorization code, or credentials.
+        logger.error(
+            "Google OAuth callback/token storage failed (%s).",
+            type(exc).__name__,
+            exc_info=True,
+        )
         return HTMLResponse(
             "Neizdevās saglabāt YouTube autorizāciju. Pārbaudi Cloud Run žurnālus.",
             status_code=500,

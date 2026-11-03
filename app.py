@@ -53,8 +53,7 @@ YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 # GOOGLE / YOUTUBE OAUTH
 # ---------------------------------------------------------
 
-def create_oauth_flow(state: Optional[str] = None,
-                      code_verifier: Optional[str] = None) -> Flow:
+def create_oauth_flow(state: Optional[str] = None) -> Flow:
     if not CLIENT_ID or not CLIENT_SECRET:
         raise RuntimeError(
             "Google OAuth is not configured. Set GOOGLE_CLIENT_ID "
@@ -75,8 +74,7 @@ def create_oauth_flow(state: Optional[str] = None,
         client_config,
         scopes=YOUTUBE_SCOPES,
         state=state,
-        code_verifier=code_verifier,
-        autogenerate_code_verifier=(code_verifier is None),
+        autogenerate_code_verifier=False,
     )
     flow.redirect_uri = REDIRECT_URI
     return flow
@@ -102,7 +100,6 @@ async def auth_login(request: Request):
             prompt="consent",
         )
         request.session["oauth_state"] = state
-        request.session["oauth_code_verifier"] = flow.code_verifier
         return RedirectResponse(authorization_url, status_code=302)
     except Exception:
         logger.exception("Could not start Google OAuth")
@@ -115,7 +112,6 @@ async def auth_login(request: Request):
 @app.get("/oauth2callback")
 async def oauth_callback(request: Request):
     state = request.session.get("oauth_state")
-    code_verifier = request.session.get("oauth_code_verifier")
 
     if not state:
         return HTMLResponse(
@@ -124,11 +120,10 @@ async def oauth_callback(request: Request):
         )
 
     try:
-        flow = create_oauth_flow(state=state, code_verifier=code_verifier)
+        flow = create_oauth_flow(state=state)
         flow.fetch_token(authorization_response=str(request.url))
         save_youtube_token(flow.credentials)
         request.session.pop("oauth_state", None)
-        request.session.pop("oauth_code_verifier", None)
         request.session["youtube_connected"] = True
         return RedirectResponse("/", status_code=303)
     except Exception:

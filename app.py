@@ -1,11 +1,15 @@
 import os
 import json
 import logging
+import os
+import tempfile
+import subprocess
+from pathlib import Path
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
 from google_auth_oauthlib.flow import Flow
@@ -47,6 +51,12 @@ YOUTUBE_TOKEN_SECRET = os.getenv("YOUTUBE_TOKEN_SECRET", "youtube-oauth-token")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+PIPER_ENABLED = os.getenv("PIPER_ENABLED", "true").lower() == "true"
+PIPER_VOICES = {
+    "narrator": "en_US-lessac-medium",
+    "rabbit": "en_US-amy-medium",
+    "turtle": "en_US-ryan-high",
+}
 
 YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
@@ -329,6 +339,48 @@ async def story_generate(data: StoryRequest):
         )
 
 
+
+class SpeechRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=12000)
+    voice: str = Field(default="narrator", pattern="^(narrator|rabbit|turtle)$")
+
+
+@app.post("/speech/generate")
+async def speech_generate(data: SpeechRequest):
+    """Generate speech only when the user presses the audio button."""
+    if not PIPER_ENABLED:
+        return JSONResponse({"ok": False, "error": "Piper balss ģenerēšana ir izslēgta."}, status_code=503)
+    voice_model = PIPER_VOICES[data.voice]
+    output_path = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="wonderpals_", suffix=".wav", delete=False) as wav_file:
+            output_path = wav_file.name
+        # Piper downloads the selected voice on first use and reuses it afterwards.
+        process = await __import__("asyncio").create_subprocess_exec(
+            "piper", "--model", voice_model, "--output_file", output_path,
+            stdin=__import__("asyncio").subprocess.PIPE,
+            stdout=__import__("asyncio").subprocess.PIPE,
+            stderr=__import__("asyncio").subprocess.PIPE,
+        )
+        _, stderr = await process.communicate(data.text.encode("utf-8"))
+        if process.returncode != 0 or not Path(output_path).exists() or Path(output_path).stat().st_size < 1000:
+            detail = stderr.decode("utf-8", errors="replace")[-500:]
+            raise RuntimeError(detail or "Piper nevarēja izveidot audio failu.")
+        return FileResponse(
+            output_path, media_type="audio/wav", filename="wonderpals_story.wav",
+            background=__import__("starlette.background", fromlist=["BackgroundTask"]).BackgroundTask(lambda: Path(output_path).unlink(missing_ok=True)),
+        )
+    except FileNotFoundError:
+        if output_path:
+            Path(output_path).unlink(missing_ok=True)
+        return JSONResponse({"ok": False, "error": "Piper nav instalēts konteinerā. Pārbaudi Dockerfile."}, status_code=503)
+    except Exception as exc:
+        if output_path:
+            Path(output_path).unlink(missing_ok=True)
+        logger.exception("Piper speech generation failed")
+        return JSONResponse({"ok": False, "error": f"Neizdevās izveidot balsi: {str(exc)[:300]}"}, status_code=502)
+
+
 # ---------------------------------------------------------
 # HEALTH CHECKS AND HOME PAGE
 # ---------------------------------------------------------
@@ -337,7 +389,8 @@ async def story_generate(data: StoryRequest):
 async def health():
     return {
         "status": "ok",
-        "huggingface_configured": bool(HF_TOKEN),
+        "groq_configured": bool(GROQ_API_KEY),
+        "piper_enabled": PIPER_ENABLED,
         "youtube_oauth_configured": bool(CLIENT_ID and CLIENT_SECRET),
     }
 
@@ -403,6 +456,17 @@ async def home(request: Request):
     <button id="generate" onclick="makeStory()">✨ Ģenerēt stāstu</button>
     <p id="message" class="muted"></p>
     <pre id="story"></pre>
+    <hr>
+    <h3>🔊 Pārvērst stāstu balsī</h3>
+    <label>Izvēlies balsi</label>
+    <select id="voice">
+      <option value="narrator">Stāstnieks — mierīga balss</option>
+      <option value="rabbit">Trusis — gaišāka balss</option>
+      <option value="turtle">Bruņurupucis — zemāka balss</option>
+    </select>
+    <button id="speak" onclick="makeAudio()">🎙️ Izveidot audio</button>
+    <p id="audioMessage" class="muted">Audio tiek veidots tikai pēc pogas nospiešanas.</p>
+    <audio id="audioPlayer" controls style="width:100%;display:none"></audio>
   </section>
   <script>
     async function checkYouTube(){
@@ -430,12 +494,31 @@ async def home(request: Request):
       }
     }
 
+    async function makeAudio(){
+      const story=document.getElementById('story').textContent.trim();
+      const button=document.getElementById('speak');
+      const message=document.getElementById('audioMessage');
+      const player=document.getElementById('audioPlayer');
+      if(!story){message.textContent='Vispirms ģenerē stāstu.';return;}
+      button.disabled=true; message.textContent='🎙️ Veido audio. Pirmajā reizē balss modelis var lejupielādēties...';
+      player.style.display='none';
+      try{
+        const response=await fetch('/speech/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:story,voice:document.getElementById('voice').value})});
+        if(!response.ok){let err={};try{err=await response.json();}catch(e){}throw new Error(err.error||'Audio izveide neizdevās');}
+        const blob=await response.blob();
+        if(window.currentAudioUrl) URL.revokeObjectURL(window.currentAudioUrl);
+        window.currentAudioUrl=URL.createObjectURL(blob);player.src=window.currentAudioUrl;player.style.display='block';
+        message.textContent='Audio gatavs! Nospied atskaņošanas pogu.';
+      }catch(error){message.textContent='Kļūda: '+error.message;}
+      finally{button.disabled=false;}
+    }
+
     async function makeStory(){
       const button=document.getElementById('generate');
       const message=document.getElementById('message');
       const output=document.getElementById('story');
       button.disabled=true;
-      message.textContent='✨ Hugging Face raksta stāstu...';
+      message.textContent='✨ Groq raksta stāstu...';
       output.textContent='';
       try{
         const response=await fetch('/story/generate',{

@@ -6,3 +6,5 @@ google-auth>=2.35,<3
 google-auth-oauthlib>=1.2,<2
 google-cloud-secret-manager>=2.21,<3
 piper-tts>=1.2,<2
+
+python-multipart>=0.0.9,<1
